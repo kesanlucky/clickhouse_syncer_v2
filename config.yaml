@@ -1,0 +1,69 @@
+# ClickHouse Data Syncer - Example Configuration
+# Copy to config.yaml and modify as needed.
+
+source:
+  host: 127.0.0.1
+  port: 9000
+  database: default
+  user: default
+  password: ""
+
+destination:
+  host: 127.0.0.1
+  port: 9001
+  database: default
+  user: default
+  password: ""
+
+# Timezone for all date operations.
+# Default: Asia/Kolkata
+timezone: "Asia/Kolkata"
+
+sync:
+  batch_size: 50000
+  max_concurrency: 4
+
+  standby:
+    enabled: true
+    interval: 5m
+
+  retries:
+    enabled: true
+    max_attempts: 3
+    backoff: 5s
+
+logging:
+  level: info
+  directory: ./logs
+  console: true
+
+tables:
+  - name: mysql_hub.status_90
+    date_column: event_time
+
+  - name: postgres_hub.status_90
+    date_column: event_time
+
+  - name: mongodb_hub.status_90
+    date_column: event_time
+
+  - name: oracle_hub.status_90
+    date_column: event_time
+
+  - name: mssql_hub.status_90
+    date_column: event_time
+
+  - name: clickhouse_hub.status_90
+    date_column: event_time
+
+  - name: redis_hub.status_90
+    date_column: event_time
+
+  - name: kafka_hub.status_90
+    date_column: event_time
+
+  - name: mysql_replica_hub.status_90
+    date_column: event_time
+
+  - name: analytics_hub.status_90
+    date_column: event_time

@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  clickhouse-source:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-source
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - clickhouse-source-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  clickhouse-destination:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-destination
+    ports:
+      - "9001:9000"
+      - "8124:8123"
+    volumes:
+      - clickhouse-destination-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  clickhouse-source-data:
+  clickhouse-destination-data:
