@@ -30,6 +30,16 @@ type ClickHouseConfig struct {
 	Database string `yaml:"database"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
+	// Protocol selects the transport: "native" (default, port 9000) or "http" (port 8123).
+	Protocol string `yaml:"protocol"`
+}
+
+// DefaultPort returns the conventional default port for the configured protocol.
+func (c *ClickHouseConfig) DefaultPort() int {
+	if c.Protocol == "http" {
+		return 8123
+	}
+	return 9000
 }
 
 func (c *ClickHouseConfig) Addr() string {
@@ -37,7 +47,11 @@ func (c *ClickHouseConfig) Addr() string {
 }
 
 func (c *ClickHouseConfig) DSN() string {
-	return fmt.Sprintf("clickhouse://%s:%s@%s/%s", c.User, c.Password, c.Addr(), c.Database)
+	scheme := "clickhouse"
+	if c.Protocol == "http" {
+		scheme = "http"
+	}
+	return fmt.Sprintf("%s://%s:%s@%s/%s", scheme, c.User, c.Password, c.Addr(), c.Database)
 }
 
 type StandbyConfig struct {
@@ -99,23 +113,27 @@ func Load(path string) (*Config, error) {
 			Console:   true,
 		},
 		Timezone: "Asia/Kolkata",
-		Source: ClickHouseConfig{
-			Port: 9000,
-		},
-		Destination: ClickHouseConfig{
-			Port: 9000,
-		},
+		Source:      ClickHouseConfig{},
+		Destination: ClickHouseConfig{},
 	}
 
 	if err := yaml.Unmarshal(data, c); err != nil {
 		return nil, fmt.Errorf("failed to parse yaml: %w", err)
 	}
 
+	// Apply protocol defaults before port defaults so DefaultPort() is correct.
+	if c.Source.Protocol == "" {
+		c.Source.Protocol = "native"
+	}
+	if c.Destination.Protocol == "" {
+		c.Destination.Protocol = "native"
+	}
+
 	if c.Source.Port == 0 {
-		c.Source.Port = 9000
+		c.Source.Port = c.Source.DefaultPort()
 	}
 	if c.Destination.Port == 0 {
-		c.Destination.Port = 9000
+		c.Destination.Port = c.Destination.DefaultPort()
 	}
 
 	if err := c.Validate(); err != nil {
@@ -130,12 +148,21 @@ var (
 	columnNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 )
 
+var validProtocols = map[string]bool{"native": true, "http": true}
+
 func (c *Config) Validate() error {
 	if c.Source.Host == "" {
 		return &ConfigError{Field: "source.host", Message: "required field missing"}
 	}
 	if c.Destination.Host == "" {
 		return &ConfigError{Field: "destination.host", Message: "required field missing"}
+	}
+
+	if !validProtocols[c.Source.Protocol] {
+		return &ConfigError{Field: "source.protocol", Message: "invalid protocol", Expected: "native/http", Actual: c.Source.Protocol}
+	}
+	if !validProtocols[c.Destination.Protocol] {
+		return &ConfigError{Field: "destination.protocol", Message: "invalid protocol", Expected: "native/http", Actual: c.Destination.Protocol}
 	}
 
 	if c.Source.Port < 1 || c.Source.Port > 65535 {

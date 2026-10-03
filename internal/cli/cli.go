@@ -16,6 +16,7 @@ import (
 // NewRootCommand creates and configures the root cobra command for the CLI.
 func NewRootCommand() *cobra.Command {
 	var configPath string
+	var enableUI bool
 
 	rootCmd := &cobra.Command{
 		Use:           "clickhouse-syncer",
@@ -27,13 +28,14 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
+	rootCmd.PersistentFlags().BoolVar(&enableUI, "ui", false, "Enable rich terminal UI (progress bars, coloured output)")
 
 	// Validate command
 	validateCmd := &cobra.Command{
 		Use:   "validate",
 		Short: "Validate the configuration and schema",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			_, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -49,7 +51,7 @@ func NewRootCommand() *cobra.Command {
 		Use:   "sync",
 		Short: "Synchronize data for a specific date",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -76,7 +78,7 @@ func NewRootCommand() *cobra.Command {
 		Use:   "delete",
 		Short: "Delete data before a specific date",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -109,7 +111,7 @@ func NewRootCommand() *cobra.Command {
 		Use:   "sync",
 		Short: "Preview sync operation",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -134,7 +136,7 @@ func NewRootCommand() *cobra.Command {
 		Use:   "delete",
 		Short: "Preview delete operation",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			cfg, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -160,7 +162,7 @@ func NewRootCommand() *cobra.Command {
 		Use:   "standby-sync",
 		Short: "Run the syncer in standby mode for continuous synchronization",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath)
+			_, logger, src, dst, s, err := setupDependencies(cmd.Context(), configPath, enableUI)
 			if err != nil {
 				return err
 			}
@@ -175,7 +177,7 @@ func NewRootCommand() *cobra.Command {
 }
 
 // setupDependencies loads configuration, sets up clients, and initializes the syncer.
-func setupDependencies(ctx context.Context, configPath string) (*config.Config, *logging.Logger, *clickhouse.Client, *clickhouse.Client, *syncer.Syncer, error) {
+func setupDependencies(ctx context.Context, configPath string, enableUI bool) (*config.Config, *logging.Logger, *clickhouse.Client, *clickhouse.Client, *syncer.Syncer, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, nil, nil, nil, nil, &syncer.SyncerError{Code: syncer.ExitConfigError, Message: "failed to load config", Err: err}
@@ -187,7 +189,12 @@ func setupDependencies(ctx context.Context, configPath string) (*config.Config, 
 	logConfig := logging.LogConfig{
 		Level:     cfg.Logging.Level,
 		Directory: cfg.Logging.Directory,
-		Console:   cfg.Logging.Console,
+		// Suppress console logging when the rich UI is active: the progress bar
+		// renderer owns stdout and uses ANSI cursor-up sequences to redraw in
+		// place. Any log line interleaved on stdout shifts the real cursor and
+		// causes each frame to append below the previous one instead of
+		// overwriting it. Logs still go to the file sink.
+		Console: cfg.Logging.Console && !enableUI,
 	}
 	logger, err := logging.NewLogger(logConfig)
 	if err != nil {
@@ -205,7 +212,7 @@ func setupDependencies(ctx context.Context, configPath string) (*config.Config, 
 		return nil, nil, nil, nil, nil, &syncer.SyncerError{Code: syncer.ExitConnectionError, Message: "failed to connect to destination", Err: err}
 	}
 
-	s, err := syncer.New(cfg, srcClient, dstClient, logger)
+	s, err := syncer.New(cfg, srcClient, dstClient, logger, enableUI)
 	if err != nil {
 		srcClient.Close()
 		dstClient.Close()

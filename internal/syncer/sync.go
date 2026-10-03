@@ -9,6 +9,7 @@ import (
 	"clickhouse-syncer/internal/clickhouse"
 	"clickhouse-syncer/internal/config"
 	"clickhouse-syncer/internal/logging"
+	"clickhouse-syncer/internal/ui"
 )
 
 func (s *Syncer) withRetry(ctx context.Context, opName string, fn func() error) error {
@@ -52,11 +53,19 @@ func (s *Syncer) withRetry(ctx context.Context, opName string, fn func() error) 
 	return fmt.Errorf("%s failed after %d attempts: %w", opName, maxAttempts, lastErr)
 }
 
-func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start, end time.Time, dateType clickhouse.DateColumnType, tableIndex, tableTotal int) TableSyncResult {
+// syncTable syncs one table for the given date range.
+// bar and barIdx are used to update the live progress display; bar may be nil.
+func (s *Syncer) syncTable(
+	ctx context.Context,
+	table config.TableConfig,
+	start, end time.Time,
+	dateType clickhouse.DateColumnType,
+	tableIndex, tableTotal int,
+	bar *ui.MultiBar,
+	barIdx int,
+) TableSyncResult {
 	startT := time.Now()
-	res := TableSyncResult{
-		Table: table.Name,
-	}
+	res := TableSyncResult{Table: table.Name}
 
 	logCtx := s.logger.With(
 		"table", table.Name,
@@ -77,6 +86,9 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 	if err != nil {
 		res.Error = fmt.Errorf("failed to count source rows: %w", err)
 		logCtx.Error("Table sync failed", "error", res.Error)
+		if bar != nil {
+			bar.Failed(barIdx, res.Error.Error(), 0, time.Since(startT))
+		}
 		return res
 	}
 	res.SourceRows = sourceCount
@@ -85,7 +97,15 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 		logCtx.Info("No rows to sync")
 		res.Verified = true
 		res.Duration = time.Since(startT)
+		if bar != nil {
+			bar.Done(barIdx, 0, 0, 0, res.Duration)
+		}
 		return res
+	}
+
+	// Set bar total now that we know it
+	if bar != nil {
+		bar.SetTotal(barIdx, sourceCount)
 	}
 
 	// 2. Count dest before
@@ -98,6 +118,9 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 	if err != nil {
 		res.Error = fmt.Errorf("failed to count dest rows before: %w", err)
 		logCtx.Error("Table sync failed", "error", res.Error)
+		if bar != nil {
+			bar.Failed(barIdx, res.Error.Error(), 0, time.Since(startT))
+		}
 		return res
 	}
 	res.DestRowsBefore = destCountBefore
@@ -110,6 +133,9 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 		if err != nil {
 			res.Error = fmt.Errorf("failed to delete dest rows: %w", err)
 			logCtx.Error("Table sync failed", "error", res.Error)
+			if bar != nil {
+				bar.Failed(barIdx, res.Error.Error(), 0, time.Since(startT))
+			}
 			return res
 		}
 
@@ -118,21 +144,48 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 		if err != nil {
 			res.Error = fmt.Errorf("failed waiting for mutations: %w", err)
 			logCtx.Error("Table sync failed", "error", res.Error)
+			if bar != nil {
+				bar.Failed(barIdx, res.Error.Error(), 0, time.Since(startT))
+			}
 			return res
 		}
 	}
 
-	// 5. Transfer batches
-	batches, inserted, err := s.transferBatches(ctx, table, start, end, dateType, sourceCount)
+	// 5. Fetch schema for the ColumnSizer
+	schema, err := s.source.DescribeTable(ctx, table.Name)
+	if err != nil {
+		res.Error = fmt.Errorf("failed to describe source table: %w", err)
+		logCtx.Error("Table sync failed", "error", res.Error)
+		if bar != nil {
+			bar.Failed(barIdx, res.Error.Error(), 0, time.Since(startT))
+		}
+		return res
+	}
+	sizer := clickhouse.NewColumnSizer(schema)
+
+	// 6. Transfer batches
+	progressFn := func(inserted, total, bytesRaw uint64, throughputMBs float64) {
+		if bar != nil {
+			bar.Update(barIdx, inserted, total, bytesRaw, throughputMBs)
+		} else if s.ui {
+			// non-TTY plain update
+		}
+	}
+
+	batches, inserted, bytesRaw, err := s.transferBatches(ctx, table, start, end, dateType, sourceCount, sizer, progressFn, logCtx)
 	if err != nil {
 		res.Error = fmt.Errorf("transfer failed: %w", err)
 		logCtx.Error("Table sync failed", "error", res.Error)
+		if bar != nil {
+			bar.Failed(barIdx, res.Error.Error(), bytesRaw, time.Since(startT))
+		}
 		return res
 	}
 	res.BatchesProcessed = batches
 	res.RowsInserted = inserted
+	res.BytesTransferred = bytesRaw
 
-	// 6. Count dest after
+	// 7. Count dest after
 	var destCountAfter uint64
 	err = s.withRetry(ctx, "count dest rows after", func() error {
 		var e error
@@ -142,26 +195,60 @@ func (s *Syncer) syncTable(ctx context.Context, table config.TableConfig, start,
 	if err != nil {
 		res.Error = fmt.Errorf("failed to count dest rows after: %w", err)
 		logCtx.Error("Table sync failed", "error", res.Error)
+		if bar != nil {
+			bar.Failed(barIdx, res.Error.Error(), bytesRaw, time.Since(startT))
+		}
 		return res
 	}
 	res.DestRowsAfter = destCountAfter
 
-	// 7. Verify
+	// 8. Verify
 	res.Verified = destCountAfter == sourceCount
-	if !res.Verified {
-		logCtx.Warn("Verification failed", "source_count", sourceCount, "dest_after", destCountAfter)
-	} else {
-		logCtx.Info("Sync completed successfully", "inserted", inserted, "duration", time.Since(startT))
+	res.Duration = time.Since(startT)
+
+	avgRow := uint64(0)
+	if inserted > 0 {
+		avgRow = bytesRaw / inserted
 	}
 
-	res.Duration = time.Since(startT)
+	if !res.Verified {
+		logCtx.Warn("Verification failed",
+			"source_count", sourceCount,
+			"dest_after", destCountAfter,
+			"total_bytes_raw", bytesRaw,
+		)
+	} else {
+		logCtx.Info("Sync completed successfully",
+			"inserted", inserted,
+			"total_bytes_raw", bytesRaw,
+			"avg_row_bytes", avgRow,
+			"duration_ms", res.Duration.Milliseconds(),
+		)
+	}
+
+	if bar != nil {
+		bar.Done(barIdx, inserted, bytesRaw, avgRow, res.Duration)
+	}
+
 	return res
 }
 
-func (s *Syncer) transferBatches(ctx context.Context, table config.TableConfig, start, end time.Time, dateType clickhouse.DateColumnType, sourceRowCount uint64) (int, uint64, error) {
+// transferBatches reads data from source in batches and inserts into dest.
+// It returns (batchCount, rowsInserted, bytesRaw, error).
+// progressFn is called after each successful insert; it may be nil.
+func (s *Syncer) transferBatches(
+	ctx context.Context,
+	table config.TableConfig,
+	start, end time.Time,
+	dateType clickhouse.DateColumnType,
+	sourceRowCount uint64,
+	sizer *clickhouse.ColumnSizer,
+	progressFn func(inserted, total, bytesRaw uint64, throughputMBs float64),
+	logCtx *logging.Logger,
+) (batches int, inserted uint64, bytesRaw uint64, err error) {
 	columns, err := s.source.GetColumns(ctx, table.Name)
 	if err != nil {
-		return 0, 0, fmt.Errorf("get columns: %w", err)
+		return 0, 0, 0, fmt.Errorf("get columns: %w", err)
 	}
 
 	batchSize := s.config.Sync.BatchSize
@@ -171,50 +258,67 @@ func (s *Syncer) transferBatches(ctx context.Context, table config.TableConfig, 
 
 	reader, err := s.source.NewBatchReader(ctx, table.Name, columns, table.DateColumn, start, end, dateType, batchSize)
 	if err != nil {
-		return 0, 0, fmt.Errorf("new batch reader: %w", err)
+		return 0, 0, 0, fmt.Errorf("new batch reader: %w", err)
 	}
 	defer reader.Close()
 
-	var totalInserted uint64
-	var batchesProcessed int
+	transferStart := time.Now()
 	lastLogTime := time.Now()
 
 	for {
-		batch, err := reader.ReadBatch()
-		if err != nil {
-			if err == io.EOF {
-				break // All data read
+		batch, readErr := reader.ReadBatch()
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
 			}
-			return batchesProcessed, totalInserted, fmt.Errorf("read batch: %w", err)
+			return batches, inserted, bytesRaw, fmt.Errorf("read batch: %w", readErr)
 		}
 		if batch == nil || batch.Count == 0 {
 			break
 		}
 
-		err = s.withRetry(ctx, "insert batch", func() error {
-			_, err := s.dest.InsertBatch(ctx, table.Name, batch.Columns, batch.Rows)
-			return err
+		// Measure raw ClickHouse bytes for this batch
+		batchBytes := sizer.BatchBytes(batch.Rows)
+
+		insertErr := s.withRetry(ctx, "insert batch", func() error {
+			_, e := s.dest.InsertBatch(ctx, table.Name, batch.Columns, batch.Rows)
+			return e
 		})
-		if err != nil {
-			return batchesProcessed, totalInserted, fmt.Errorf("insert batch: %w", err)
+		if insertErr != nil {
+			return batches, inserted, bytesRaw, fmt.Errorf("insert batch: %w", insertErr)
 		}
 
-		batchesProcessed++
-		totalInserted += uint64(batch.Count)
+		batches++
+		inserted += uint64(batch.Count)
+		bytesRaw += batchBytes
 
-		// Log progress
+		// Compute throughput
+		elapsed := time.Since(transferStart).Seconds()
+		throughputMBs := 0.0
+		if elapsed > 0 {
+			throughputMBs = float64(bytesRaw) / (1024 * 1024) / elapsed
+		}
+
+		// Notify progress callback
+		if progressFn != nil {
+			progressFn(inserted, sourceRowCount, bytesRaw, throughputMBs)
+		}
+
+		// Structured log progress (always, independent of --ui)
 		now := time.Now()
-		if batchesProcessed%5 == 0 || now.Sub(lastLogTime) > 10*time.Second {
-			pct := float64(totalInserted) / float64(sourceRowCount) * 100
-			s.logger.Info("Transfer progress",
-				"table", table.Name,
-				"inserted", totalInserted,
+		if batches%5 == 0 || now.Sub(lastLogTime) > 10*time.Second {
+			pct := float64(inserted) / float64(sourceRowCount) * 100
+			logCtx.Info("Transfer progress",
+				"inserted", inserted,
 				"total", sourceRowCount,
 				"percent", fmt.Sprintf("%.1f%%", pct),
+				"bytes_raw", bytesRaw,
+				"batch_bytes_raw", batchBytes,
+				"throughput_mbps", fmt.Sprintf("%.2f", throughputMBs),
 			)
 			lastLogTime = now
 		}
 	}
 
-	return batchesProcessed, totalInserted, nil
+	return batches, inserted, bytesRaw, nil
 }

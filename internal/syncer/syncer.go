@@ -10,6 +10,7 @@ import (
 	"clickhouse-syncer/internal/clickhouse"
 	"clickhouse-syncer/internal/config"
 	"clickhouse-syncer/internal/logging"
+	"clickhouse-syncer/internal/ui"
 )
 
 // Operation represents a sync operation type.
@@ -80,6 +81,7 @@ type Syncer struct {
 	dest     *clickhouse.Client
 	logger   *logging.Logger
 	timezone *time.Location
+	ui       bool // whether to render rich terminal output
 }
 
 // TableSyncResult holds the result of syncing one table.
@@ -90,6 +92,7 @@ type TableSyncResult struct {
 	DestRowsAfter    uint64
 	BatchesProcessed int
 	RowsInserted     uint64
+	BytesTransferred uint64 // uncompressed ClickHouse row bytes
 	Duration         time.Duration
 	Verified         bool
 	Error            error
@@ -107,13 +110,14 @@ type TableDeleteResult struct {
 
 // SyncSummary holds the overall operation summary.
 type SyncSummary struct {
-	Operation         Operation
-	Date              string
-	TablesSuccessful  int
-	TablesFailed      int
-	TotalRowsInserted uint64
-	TotalDuration     time.Duration
-	TableResults      []TableSyncResult
+	Operation             Operation
+	Date                  string
+	TablesSuccessful      int
+	TablesFailed          int
+	TotalRowsInserted     uint64
+	TotalBytesTransferred uint64
+	TotalDuration         time.Duration
+	TableResults          []TableSyncResult
 }
 
 // DeleteSummary holds the overall delete summary.
@@ -127,7 +131,7 @@ type DeleteSummary struct {
 }
 
 // New creates a new Syncer instance.
-func New(cfg *config.Config, source, dest *clickhouse.Client, logger *logging.Logger) (*Syncer, error) {
+func New(cfg *config.Config, source, dest *clickhouse.Client, logger *logging.Logger, enableUI bool) (*Syncer, error) {
 	tz, err := cfg.GetTimezone()
 	if err != nil {
 		return nil, &SyncerError{Code: ExitConfigError, Message: "invalid timezone", Err: err}
@@ -138,6 +142,7 @@ func New(cfg *config.Config, source, dest *clickhouse.Client, logger *logging.Lo
 		dest:     dest,
 		logger:   logger,
 		timezone: tz,
+		ui:       enableUI,
 	}, nil
 }
 
@@ -154,14 +159,78 @@ func (s *Syncer) parseDate(dateStr string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02", dateStr, s.timezone)
 }
 
-// printHeader prints a formatted operation header.
-func (s *Syncer) printHeader(op Operation, dateStr string, tables int) {
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("ClickHouse Data Syncer\n")
-	fmt.Printf("Operation: %s\n", op)
-	fmt.Printf("Date/Target: %s\n", dateStr)
-	fmt.Printf("Tables: %d\n", tables)
-	fmt.Println(strings.Repeat("=", 60))
+// printHeader prints the operation header to stdout (only when --ui is set).
+func (s *Syncer) printHeader(op Operation, target string, tables int) {
+	if !s.ui {
+		return
+	}
+	ui.PrintHeader(op.String(), target, tables)
+}
+
+// printValidationResult prints the validation result (only when --ui is set).
+func (s *Syncer) printValidationResult(res *ValidationResult) {
+	if !s.ui {
+		return
+	}
+	steps := make([]ui.ValidationStep, len(res.Steps))
+	for i, step := range res.Steps {
+		steps[i] = ui.ValidationStep{
+			Name:    step.Name,
+			Passed:  step.Passed,
+			Message: step.Message,
+		}
+	}
+	ui.PrintValidationResult(steps, res.Passed)
+}
+
+// printSyncSummary prints the sync summary (only when --ui is set).
+func (s *Syncer) printSyncSummary(summary *SyncSummary) {
+	if !s.ui {
+		return
+	}
+	rows := make([]ui.SyncTableRow, len(summary.TableResults))
+	for i, r := range summary.TableResults {
+		errStr := ""
+		if r.Error != nil {
+			errStr = r.Error.Error()
+		}
+		rows[i] = ui.SyncTableRow{
+			Table:    r.Table,
+			OK:       r.Error == nil,
+			Verified: r.Verified,
+			Rows:     r.RowsInserted,
+			Bytes:    r.BytesTransferred,
+			Duration: r.Duration,
+			Error:    errStr,
+		}
+	}
+	ui.PrintSyncSummary(rows, summary.Date,
+		summary.TotalRowsInserted, summary.TotalBytesTransferred,
+		summary.TotalDuration, summary.TablesFailed)
+}
+
+// printDeleteSummary prints the delete summary (only when --ui is set).
+func (s *Syncer) printDeleteSummary(summary *DeleteSummary) {
+	if !s.ui {
+		return
+	}
+	rows := make([]ui.DeleteTableRow, len(summary.TableResults))
+	for i, r := range summary.TableResults {
+		errStr := ""
+		if r.Error != nil {
+			errStr = r.Error.Error()
+		}
+		rows[i] = ui.DeleteTableRow{
+			Table:    r.Table,
+			OK:       r.Error == nil,
+			Verified: r.Verified,
+			Rows:     r.RowsBeforeCutoff,
+			Duration: r.Duration,
+			Error:    errStr,
+		}
+	}
+	ui.PrintDeleteSummary(rows, summary.BeforeDate,
+		summary.TotalRowsDeleted, summary.TotalDuration, summary.TablesFailed)
 }
 
 // formatNumber formats a number with comma separators.
@@ -176,52 +245,6 @@ func formatNumber(n uint64) string {
 		}
 	}
 	return string(b)
-}
-
-// printSyncSummary prints a formatted sync summary.
-func (s *Syncer) printSyncSummary(summary *SyncSummary) {
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("SYNC SUMMARY")
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Date: %s\n", summary.Date)
-	fmt.Printf("Total Duration: %s\n", summary.TotalDuration.Round(time.Millisecond))
-	fmt.Printf("Tables Sync'd: %d\n", summary.TablesSuccessful)
-	fmt.Printf("Tables Failed: %d\n", summary.TablesFailed)
-	fmt.Printf("Total Rows Inserted: %s\n", formatNumber(summary.TotalRowsInserted))
-	fmt.Println(strings.Repeat("-", 60))
-	for _, tr := range summary.TableResults {
-		if tr.Error != nil {
-			fmt.Printf("✗ %s: Failed (%v)\n", tr.Table, tr.Error)
-		} else if tr.Verified {
-			fmt.Printf("✓ %s: %s rows in %s\n", tr.Table, formatNumber(tr.RowsInserted), tr.Duration.Round(time.Millisecond))
-		} else {
-			fmt.Printf("! %s: %s rows in %s (Verification Failed)\n", tr.Table, formatNumber(tr.RowsInserted), tr.Duration.Round(time.Millisecond))
-		}
-	}
-	fmt.Println(strings.Repeat("=", 60))
-}
-
-// printDeleteSummary prints a formatted delete summary.
-func (s *Syncer) printDeleteSummary(summary *DeleteSummary) {
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("DELETE SUMMARY")
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Before Date: %s\n", summary.BeforeDate)
-	fmt.Printf("Total Duration: %s\n", summary.TotalDuration.Round(time.Millisecond))
-	fmt.Printf("Tables Processed: %d\n", summary.TablesSuccessful)
-	fmt.Printf("Tables Failed: %d\n", summary.TablesFailed)
-	fmt.Printf("Total Rows Deleted: %s\n", formatNumber(summary.TotalRowsDeleted))
-	fmt.Println(strings.Repeat("-", 60))
-	for _, tr := range summary.TableResults {
-		if tr.Error != nil {
-			fmt.Printf("✗ %s: Failed (%v)\n", tr.Table, tr.Error)
-		} else if tr.Verified {
-			fmt.Printf("✓ %s: %s rows deleted in %s\n", tr.Table, formatNumber(tr.RowsBeforeCutoff), tr.Duration.Round(time.Millisecond))
-		} else {
-			fmt.Printf("! %s: %s rows deleted in %s (Verification Failed)\n", tr.Table, formatNumber(tr.RowsBeforeCutoff), tr.Duration.Round(time.Millisecond))
-		}
-	}
-	fmt.Println(strings.Repeat("=", 60))
 }
 
 // RunSync orchestrates the sync operation.
@@ -239,7 +262,7 @@ func (s *Syncer) RunSync(ctx context.Context, dateStr string, selectedTables []c
 
 	validRes, err := s.ValidateAll(ctx, tables)
 	if err != nil {
-		return nil, err // Returns SyncerError
+		return nil, err
 	}
 	if !validRes.Passed {
 		return nil, &SyncerError{Code: ExitValidationError, Message: "validation failed"}
@@ -248,6 +271,17 @@ func (s *Syncer) RunSync(ctx context.Context, dateStr string, selectedTables []c
 	summary := &SyncSummary{
 		Operation: OpSync,
 		Date:      dateStr,
+	}
+
+	// Build progress bars if UI is enabled
+	var bar *ui.MultiBar
+	if s.ui {
+		names := make([]string, len(tables))
+		for i, t := range tables {
+			names[i] = t.Name
+		}
+		fmt.Println() // spacing after validation output — must come BEFORE NewMultiBar
+		bar = ui.NewMultiBar(names)
 	}
 
 	sem := make(chan struct{}, s.config.Sync.MaxConcurrency)
@@ -266,6 +300,9 @@ func (s *Syncer) RunSync(ctx context.Context, dateStr string, selectedTables []c
 			dateType, err := s.source.GetDateColumnType(ctx, t.Name, t.DateColumn)
 			if err != nil {
 				res := TableSyncResult{Table: t.Name, Error: fmt.Errorf("failed to get date column type: %w", err)}
+				if bar != nil {
+					bar.Failed(index, err.Error(), 0, 0)
+				}
 				mu.Lock()
 				summary.TableResults = append(summary.TableResults, res)
 				summary.TablesFailed++
@@ -273,7 +310,7 @@ func (s *Syncer) RunSync(ctx context.Context, dateStr string, selectedTables []c
 				return
 			}
 
-			res := s.syncTable(ctx, t, targetDate, endDate, dateType, index+1, len(tables))
+			res := s.syncTable(ctx, t, targetDate, endDate, dateType, index+1, len(tables), bar, index)
 
 			mu.Lock()
 			summary.TableResults = append(summary.TableResults, res)
@@ -282,12 +319,16 @@ func (s *Syncer) RunSync(ctx context.Context, dateStr string, selectedTables []c
 			} else {
 				summary.TablesSuccessful++
 				summary.TotalRowsInserted += res.RowsInserted
+				summary.TotalBytesTransferred += res.BytesTransferred
 			}
 			mu.Unlock()
 		}(table, i)
 	}
 
 	wg.Wait()
+	if s.ui {
+		fmt.Println() // blank line after bars
+	}
 	summary.TotalDuration = time.Since(startTime)
 	s.printSyncSummary(summary)
 
@@ -324,7 +365,9 @@ func (s *Syncer) RunDelete(ctx context.Context, beforeStr string, selectedTables
 			return nil, &SyncerError{Code: ExitGeneralFailure, Message: "confirmation failed", Err: err}
 		}
 		if !confirmed {
-			fmt.Println("Operation cancelled by user.")
+			if s.ui {
+				fmt.Println("Operation cancelled by user.")
+			}
 			return nil, nil
 		}
 	}
@@ -381,7 +424,9 @@ func (s *Syncer) RunDryRun(ctx context.Context, op Operation, dateStr, beforeStr
 		return &SyncerError{Code: ExitGeneralFailure, Message: "failed to parse date", Err: err}
 	}
 
-	fmt.Println("\nRunning Validation...")
+	if s.ui {
+		fmt.Println("\nRunning Validation...")
+	}
 	var validRes *ValidationResult
 	if op == OpSync {
 		validRes, err = s.ValidateAll(ctx, tables)
@@ -394,6 +439,10 @@ func (s *Syncer) RunDryRun(ctx context.Context, op Operation, dateStr, beforeStr
 	}
 	if !validRes.Passed {
 		return &SyncerError{Code: ExitValidationError, Message: "validation failed"}
+	}
+
+	if !s.ui {
+		return nil
 	}
 
 	fmt.Printf("\nDRY RUN\n")
@@ -487,7 +536,10 @@ func (s *Syncer) RunValidate(ctx context.Context) error {
 		return &SyncerError{Code: ExitValidationError, Message: "validation failed"}
 	}
 
-	fmt.Println("\nAll validation steps passed successfully!")
+	if s.ui {
+		fmt.Printf("\n  %s%sAll validation steps passed successfully!%s\n\n",
+			ui.AnsiBold, ui.AnsiGreen, ui.AnsiReset)
+	}
 	return nil
 }
 

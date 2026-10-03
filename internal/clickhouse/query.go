@@ -62,7 +62,7 @@ type SchemaDiff struct {
 }
 
 func (d *SchemaDiff) HasDifferences() bool {
-	return len(d.Mismatches) > 0 || len(d.MissingInDest) > 0 || len(d.ExtraInDest) > 0
+	return len(d.Mismatches) > 0 || len(d.MissingInDest) > 0
 }
 
 func (d *SchemaDiff) String() string {
@@ -198,14 +198,6 @@ func CompareSchemas(source, dest []ColumnInfo) *SchemaDiff {
 			diff.Mismatches = append(diff.Mismatches, ColumnMismatch{
 				Column: srcCol.Name, Field: "type",
 				Source: srcCol.Type, Dest: destCol.Type,
-			})
-		}
-
-		if srcCol.Position != destCol.Position {
-			diff.Mismatches = append(diff.Mismatches, ColumnMismatch{
-				Column: srcCol.Name, Field: "position",
-				Source: fmt.Sprintf("%d", srcCol.Position),
-				Dest:   fmt.Sprintf("%d", destCol.Position),
 			})
 		}
 

@@ -27,7 +27,10 @@ type BatchResult struct {
 	Count   int
 }
 
-// NewBatchReader creates a reader that queries data within a specific date range and fetches in batches
+// NewBatchReader opens a streaming SELECT for the given date range.
+// SETTINGS max_execution_time = 0 disables the per-query server timeout for
+// this specific long-running read; all other short queries (counts, metadata,
+// inserts) retain the connection-level max_execution_time protection.
 func (c *Client) NewBatchReader(ctx context.Context, table string, columns []string, dateCol string, start time.Time, end time.Time, dateType DateColumnType, batchSize int) (*BatchReader, error) {
 	quotedTable, err := QuoteTableName(table)
 	if err != nil {
@@ -43,8 +46,10 @@ func (c *Client) NewBatchReader(ctx context.Context, table string, columns []str
 	startStr := FormatDateBoundary(start, dateType)
 	endStr := FormatDateBoundary(end, dateType)
 
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s >= '%s' AND %s < '%s'",
-		strings.Join(quotedColumns, ", "), quotedTable, quotedDateCol, startStr, quotedDateCol, endStr)
+	query := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s >= '%s' AND %s < '%s' SETTINGS max_execution_time = 0",
+		strings.Join(quotedColumns, ", "), quotedTable, quotedDateCol, startStr, quotedDateCol, endStr,
+	)
 
 	rows, err := c.conn.Query(ctx, query)
 	if err != nil {
@@ -62,7 +67,7 @@ func (c *Client) NewBatchReader(ctx context.Context, table string, columns []str
 	}, nil
 }
 
-// ReadBatch reads the next batch of rows from the cursor
+// ReadBatch reads the next batch of rows from the cursor.
 func (br *BatchReader) ReadBatch() (*BatchResult, error) {
 	var batchRows [][]any
 	count := 0
@@ -77,7 +82,7 @@ func (br *BatchReader) ReadBatch() (*BatchResult, error) {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
-		// deref the pointers
+		// Dereference the scan-target pointers into plain values.
 		valRow := make([]any, len(br.columns))
 		for i := range row {
 			valRow[i] = reflect.ValueOf(row[i]).Elem().Interface()
@@ -104,17 +109,17 @@ func (br *BatchReader) ReadBatch() (*BatchResult, error) {
 	}, nil
 }
 
-// TotalRead returns the total number of rows read so far
+// TotalRead returns the total number of rows read so far.
 func (br *BatchReader) TotalRead() uint64 {
 	return br.totalRead
 }
 
-// Close closes the underlying rows cursor
+// Close closes the underlying rows cursor.
 func (br *BatchReader) Close() error {
 	return br.rows.Close()
 }
 
-// Columns returns the names of the columns being read
+// Columns returns the names of the columns being read.
 func (br *BatchReader) Columns() []string {
 	return br.columns
 }

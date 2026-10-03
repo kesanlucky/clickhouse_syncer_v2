@@ -42,17 +42,19 @@ func TestSchemaDiffMsg(t *testing.T) {
 	missing := &clickhouse.SchemaDiff{MissingInDest: []string{"col1"}}
 	assert.Equal(t, "missing in dest: [col1]", schemaDiffMsg(missing))
 
+	// ExtraInDest is no longer a failure condition; a diff with only extra dest columns returns ""
 	extra := &clickhouse.SchemaDiff{ExtraInDest: []string{"col2"}}
-	assert.Equal(t, "extra in dest: [col2]", schemaDiffMsg(extra))
+	assert.Equal(t, "", schemaDiffMsg(extra))
 
 	mismatch := &clickhouse.SchemaDiff{Mismatches: []clickhouse.ColumnMismatch{
 		{Column: "col3", Field: "Type", Source: "Int32", Dest: "Int64"},
 	}}
 	assert.Equal(t, "mismatch col col3 field Type (src:Int32 dst:Int64)", schemaDiffMsg(mismatch))
 
+	// ExtraInDest alongside a real failure: only the failure is reported
 	multiple := &clickhouse.SchemaDiff{
 		MissingInDest: []string{"col1"},
 		ExtraInDest:   []string{"col2"},
 	}
-	assert.Equal(t, "missing in dest: [col1]; extra in dest: [col2]", schemaDiffMsg(multiple))
+	assert.Equal(t, "missing in dest: [col1]", schemaDiffMsg(multiple))
 }

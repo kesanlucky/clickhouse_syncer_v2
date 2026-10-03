@@ -7,6 +7,7 @@ source:
   database: default
   user: default
   password: ""
+  # protocol: native  # "native" (default, port 9000) or "http" (port 8123)
 
 destination:
   host: 127.0.0.1
@@ -14,14 +15,15 @@ destination:
   database: default
   user: default
   password: ""
+  # protocol: native  # "native" (default, port 9000) or "http" (port 8123)
 
 # Timezone for all date operations.
 # Default: Asia/Kolkata
 timezone: "Asia/Kolkata"
 
 sync:
-  batch_size: 50000
-  max_concurrency: 4
+  batch_size: 300000
+  max_concurrency: 20
 
   standby:
     enabled: true

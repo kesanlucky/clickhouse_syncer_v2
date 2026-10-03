@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
+
+	"clickhouse-syncer/internal/ui"
 )
 
 func (s *Syncer) runStandbyLoop(ctx context.Context) error {
@@ -14,13 +15,9 @@ func (s *Syncer) runStandbyLoop(ctx context.Context) error {
 		return &SyncerError{Code: ExitConfigError, Message: "invalid standby interval", Err: err}
 	}
 
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("ClickHouse Data Syncer - STANDBY MODE")
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Interval: %v\n", interval)
-	fmt.Printf("Tables: %d\n", len(s.config.Tables))
-	fmt.Printf("Timezone: %s\n", s.timezone.String())
-	fmt.Println(strings.Repeat("=", 60))
+	if s.ui {
+		ui.PrintHeader("STANDBY SYNC", fmt.Sprintf("every %v", interval), len(s.config.Tables))
+	}
 
 	cycleNum := 1
 
@@ -35,15 +32,30 @@ func (s *Syncer) runStandbyLoop(ctx context.Context) error {
 			s.logger.Error("Standby cycle failed with transient error", "error", cycleErr)
 		}
 
-		fmt.Printf("\nCycle %d completed in %v. Successful: %d, Failed: %d\n", cycleNum, time.Since(start).Round(time.Millisecond), successful, failed)
+		elapsed := time.Since(start).Round(time.Millisecond)
+		s.logger.Info("Standby cycle completed",
+			"cycle", cycleNum,
+			"duration", elapsed,
+			"successful", successful,
+			"failed", failed,
+		)
+		if s.ui {
+			statusColour := ui.AnsiGreen
+			if failed > 0 {
+				statusColour = ui.AnsiRed
+			}
+			fmt.Printf("\n  Cycle %d  done in %v  —  %s%d ok  %d failed%s\n",
+				cycleNum, elapsed, statusColour, successful, failed, ui.AnsiReset)
+			fmt.Printf("  Next cycle in %v  (Ctrl+C to exit)...\n", interval)
+		}
 
 		timer := time.NewTimer(interval)
-		fmt.Printf("Waiting %v for next cycle (CTRL+C to exit)...\n", interval)
-
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			fmt.Println("\nShutdown signal received. Exiting standby mode.")
+			if s.ui {
+				fmt.Println("\nShutdown signal received. Exiting standby mode.")
+			}
 			return nil
 		case <-timer.C:
 			// next cycle

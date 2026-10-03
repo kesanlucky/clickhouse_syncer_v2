@@ -19,10 +19,17 @@ type Client struct {
 	role     string // "source" or "destination"
 }
 
-// NewClient creates a new ClickHouse client using the native protocol
+// NewClient creates a new ClickHouse client using the configured protocol (native or http)
 func NewClient(ctx context.Context, cfg config.ClickHouseConfig, role string) (*Client, error) {
+	// Map config protocol string to clickhouse-go's Protocol type.
+	proto := clickhouse.Native
+	if cfg.Protocol == "http" {
+		proto = clickhouse.HTTP
+	}
+
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)},
+		Addr:     []string{fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)},
+		Protocol: proto,
 		Auth: clickhouse.Auth{
 			Database: cfg.Database,
 			Username: cfg.User,

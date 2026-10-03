@@ -252,3 +252,67 @@ logging:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid logging level")
 }
+
+func TestLoad_ExplicitNativeProtocol(t *testing.T) {
+	content := `
+source:
+  host: "src.local"
+  protocol: native
+destination:
+  host: "dest.local"
+  protocol: native
+tables:
+  - name: "table1"
+    date_column: "date"
+`
+	path := writeTempConfig(t, content)
+	defer os.Remove(path)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "native", cfg.Source.Protocol)
+	assert.Equal(t, 9000, cfg.Source.Port)
+	assert.Contains(t, cfg.Source.DSN(), "clickhouse://")
+}
+
+func TestLoad_HTTPProtocolDefaultPort(t *testing.T) {
+	content := `
+source:
+  host: "src.local"
+  protocol: http
+destination:
+  host: "dest.local"
+  protocol: http
+  port: 8124
+tables:
+  - name: "table1"
+    date_column: "date"
+`
+	path := writeTempConfig(t, content)
+	defer os.Remove(path)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "http", cfg.Source.Protocol)
+	// Port should have been defaulted to 8123 for http when not specified.
+	assert.Equal(t, 8123, cfg.Source.Port)
+	// Explicit port on destination must be respected.
+	assert.Equal(t, 8124, cfg.Destination.Port)
+	assert.Contains(t, cfg.Source.DSN(), "http://")
+}
+
+func TestLoad_InvalidProtocol(t *testing.T) {
+	content := `
+source:
+  host: "src.local"
+  protocol: grpc
+destination:
+  host: "dest.local"
+`
+	path := writeTempConfig(t, content)
+	defer os.Remove(path)
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source.protocol")
+}
